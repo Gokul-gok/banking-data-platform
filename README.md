@@ -1,0 +1,169 @@
+# Banking Data Platform
+
+An end-to-end Azure lakehouse for a retail bank — combining a batch ETL pipeline over historical records with a real-time streaming pipeline for transactions, fraud alerts, and login events. Built on the Medallion architecture (Bronze → Silver → Gold) using Azure Databricks, Delta Lake, and Azure Data Factory.
+
+---
+
+## Architecture Overview
+
+```
+BATCH PIPELINE                          STREAMING PIPELINE
+──────────────                          ──────────────────
+CSV Files (ADLS raw)                    Event Producer (Python)
+        │                                       │
+        ▼                                       ▼
+  Bronze Layer          ◄────────────   Azure Event Hubs (Kafka)
+  (Delta, raw)                          (transactions, fraud, logins)
+        │                                       │
+        ▼                                       ▼
+  Silver Layer                           Silver Streams
+  (cleansed, typed)                      (cleansed, derived columns)
+        │                                       │
+        └───────────────┬───────────────────────┘
+                        ▼
+                   Gold Layer
+        ┌──────────────┴─────────────────┐
+        │ Batch Star Schema              │  Streaming Aggregations
+        │ (4 dims, 3 facts)              │  (9 tables, 15-min refresh)
+        └────────────────────────────────┘
+                        │
+                        ▼
+           Azure Synapse Analytics (SQL views)
+                        │
+                        ▼
+              Power BI Dashboards
+```
+
+---
+
+## Pipelines
+
+### Batch Pipeline
+Processes historical banking data through three sequential stages:
+
+| Stage | Script | What it does |
+|-------|--------|-------------|
+| Bronze | `gokul_01_bronze_ingestion.py` | Ingests CSV files from ADLS raw container into Delta format; adds `_source_file` and `_ingested_at` tracking columns |
+| Silver | `gokul_02_silver_transformation.py` | Casts dates (`dd-MM-yyyy` → DATE), normalises text (TRIM + INITCAP), casts numerics; outputs 4 clean tables |
+| Gold | `gokul_04_gold_star_schema.py` | Builds star schema with 4 dimensions and 3 facts; adds derived fields (churn status, credit tier, gap category) |
+
+### Streaming Pipeline
+Three parallel event streams multiplexed through a single Event Hub topic:
+
+| Stage | Script | What it does |
+|-------|--------|-------------|
+| Producer | `gokul_event_producer.py` | Generates synthetic events in three threads: transactions (3/11s), fraud alerts (1/12s), login events (2/10s) |
+| Bronze | `gokul_stream_bronze.py` | Kafka consumer; splits the single hub into 3 continuous Delta streams |
+| Silver | `gokul_stream_02_silver.py` | Cleans each stream; adds `amount_category`, `session_category`, date/hour components |
+| Gold | `gokul_stream_03_gold.py` | Batch job (every 15 min via ADF) that aggregates Silver into 9 Gold tables |
+
+---
+
+## Data Model
+
+### Source Datasets
+
+| Dataset | Rows | Key Fields |
+|---------|------|-----------|
+| `customers.csv` | 50,000 | customer_id, city, credit_score, created_at |
+| `accounts.csv` | 75,000 | account_id, customer_id, account_type, balance_usd, account_status |
+| `cards.csv` | 100,000 | card_id, account_id, card_type, expiration_date |
+| `loans.csv` | 30,000 | loan_id, customer_id, loan_amount, interest_rate, start_date |
+
+### Gold Layer — Batch Star Schema
+
+**Dimensions**
+- `dim_customer` — customer profile with credit tier (Excellent / Good / Fair / Poor)
+- `dim_date` — full calendar 2019–2027 with week, quarter, weekend flag
+- `dim_account_type` — Savings / Checking / Business
+- `dim_risk` — Low / Medium / High risk bands mapped to credit score ranges
+
+**Facts**
+- `fact_account` — balance, churn status (Active / Inactive / At Risk / Churned), days since last activity, signup-to-account gap category
+- `fact_loan` — loan amount, interest rate, risk category
+- `fact_card` — card type linked to account and customer
+
+### Gold Layer — Streaming Aggregations (9 tables)
+
+| Domain | Tables |
+|--------|--------|
+| Transactions | hourly summary, by city, by type × channel |
+| Fraud | summary by type/severity/action, by city, hourly trend |
+| Login | summary by method/device, failure analysis, hourly trend |
+
+---
+
+## Azure Services
+
+| Service | Role |
+|---------|------|
+| ADLS Gen2 (`gokulprojectadls`) | Storage — 4 containers: raw, bronze, silver, gold |
+| Azure Databricks | Spark compute for all batch and streaming jobs |
+| Azure Event Hubs | Kafka-compatible message bus for real-time events |
+| Azure Data Factory | Pipeline orchestration (3 pipelines) |
+| Azure Synapse Analytics | Serverless SQL views over Gold Delta tables |
+| Azure Key Vault (`kv-bd-training-uk`) | Secrets management (storage key, Event Hub connection string) |
+| Azure Logic Apps | Email notifications on pipeline success/failure |
+| Power BI | Dashboards — 5-page batch analytics + 3-page streaming ops |
+
+---
+
+## ADF Orchestration
+
+| Pipeline | Trigger | Behaviour |
+|----------|---------|-----------|
+| `banking_batch_pipeline` | Manual / scheduled | Bronze → Silver → Gold sequentially; email on each step success or failure |
+| `streaming_pipeline` | Manual (run once) | Starts Bronze + Silver streaming jobs in parallel; runs continuously; failure alerts only |
+| `streaming_gold_pipeline` | Every 15 minutes | Aggregates Silver streams into 9 Gold tables; email on completion |
+
+---
+
+## Project Structure
+
+```
+banking project/
+├── Batch/
+│   ├── Data/                            # Source CSV files
+│   │   ├── customers.csv
+│   │   ├── accounts.csv
+│   │   ├── cards.csv
+│   │   └── loans.csv
+│   ├── generate_data.py                 # Synthetic data generator
+│   ├── gokul_00_config.py               # Shared config (storage paths, Key Vault, dataset list)
+│   ├── gokul_01_bronze_ingestion.py     # Bronze layer ETL
+│   ├── gokul_02_silver_transformation.py# Silver layer ETL
+│   └── gokul_04_gold_star_schema.py     # Gold star schema builder
+├── Streaming/
+│   ├── gokul_event_producer.py          # Event Hub producer
+│   ├── gokul_stream_bronze.py           # Bronze streaming ingestion
+│   ├── gokul_stream_02_silver.py        # Silver streaming transformation
+│   └── gokul_stream_03_gold.py          # Gold streaming aggregations
+├── build_presentation.py                # Generates the .pptx deck
+├── Banking_Data_Platform_Presentation.pptx
+└── README.md
+```
+
+---
+
+## Key Business Metrics
+
+- **Churn segmentation** — accounts classified as Active, Inactive, At Risk, or Churned based on days since last activity
+- **Onboarding gap analysis** — time from customer signup to first account opening, bucketed from Same Day to More than 3 Months
+- **City-level performance** — customer counts, average balance, and loan exposure by UK city
+- **Real-time fraud monitoring** — alert volume, risk scores, and confirmed fraud rate by type and severity
+- **Login security** — success/failure rates segmented by device, method, and city
+
+---
+
+## Configuration
+
+All shared settings live in [Batch/gokul_00_config.py](Batch/gokul_00_config.py):
+
+```python
+storage_account = "gokulprojectadls"
+# Containers: raw, bronze, silver, gold
+# Path format: abfss://{container}@gokulprojectadls.dfs.core.windows.net/
+
+key_vault_name = "kv-bd-training-uk"
+# Secrets: gokul-storage-account-key, Event Hub connection string
+```
